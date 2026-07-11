@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+<meta charset="UTF-8">
+<title>Världsnyheter på karta – realtid</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tabler-icons/2.47.0/iconfont/tabler-icons.min.css" />
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif; background: #f4f3ef; color: #222; }
+  header { padding: 14px 20px; background: #fff; border-bottom: 1px solid #ddd; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+  header h1 { font-size: 18px; font-weight: 600; margin: 0; }
+  #status { font-size: 13px; color: #777; }
+  #map { width: 100%; height: calc(100vh - 130px); }
+  .legend { display: flex; gap: 18px; padding: 10px 20px; background: #fff; border-bottom: 1px solid #ddd; font-size: 13px; color: #555; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+  .news-pin { display:flex; align-items:center; justify-content:center; width:26px; height:26px; border-radius:50%; border:2px solid #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.3); color:#fff; font-size:14px; }
+  button { border: 1px solid #ccc; background: #fff; border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; }
+  button:hover { background: #f0f0f0; }
+  .popup-cat { font-size: 11px; font-weight: 600; margin: 0 0 4px; text-transform: uppercase; letter-spacing: .03em; }
+  .popup-title { font-size: 13px; font-weight: 600; margin: 0 0 6px; }
+  .popup-link { font-size: 12px; }
+  #error { display:none; padding: 12px 20px; background: #fdecea; color: #a33; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Världsnyheter på karta</h1>
+  <div style="display:flex; align-items:center; gap:12px;">
+    <span id="status">Laddar...</span>
+    <label style="font-size:13px; display:flex; align-items:center; gap:5px; cursor:pointer;">
+      <input type="checkbox" id="autoRefreshBox" onchange="setAutoRefresh(this.checked)">
+      Auto-uppdatera (var 15:e min)
+    </label>
+    <button onclick="loadAll()"><i class="ti ti-refresh" aria-hidden="true"></i> Uppdatera</button>
+  </div>
+</header>
+
+<div class="legend">
+  <span class="legend-item"><span class="legend-dot" style="background:#E24B4A"></span>Konflikt / säkerhet</span>
+  <span class="legend-item"><span class="legend-dot" style="background:#378ADD"></span>Politik</span>
+  <span class="legend-item"><span class="legend-dot" style="background:#639922"></span>Hälsa</span>
+  <span class="legend-item"><span class="legend-dot" style="background:#BA7517"></span>Katastrof / väder</span>
+  <span class="legend-item"><span class="legend-dot" style="background:#534AB7"></span>Ekonomi</span>
+</div>
+
+<div id="error"></div>
+<div id="map"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+// Kategorier: nyckelord används för BÅDE att bygga en enda kombinerad
+// sökfråga OCH för att klassificera varje träff lokalt i webbläsaren.
+// Detta ersätter 5 separata API-anrop med 1, vilket undviker att samma
+// nyhet (t.ex. en som nämner både "regering" och "militär") laddas ner
+// flera gånger.
+const CATEGORIES = {
+  conflict: { label: 'Konflikt / säkerhet', color: '#E24B4A', icon: 'ti-alert-triangle',
+    keywords: ['war', 'conflict', 'military', 'attack', 'airstrike', 'troops'] },
+  politics: { label: 'Politik', color: '#378ADD', icon: 'ti-building-bank',
+    keywords: ['election', 'president', 'government', 'parliament', 'summit', 'minister'] },
+  health: { label: 'Hälsa', color: '#639922', icon: 'ti-first-aid-kit',
+    keywords: ['outbreak', 'disease', 'hospital', 'pandemic', 'vaccine', 'virus'] },
+  disaster: { label: 'Katastrof / väder', color: '#BA7517', icon: 'ti-cloud-storm',
+    keywords: ['earthquake', 'flood', 'wildfire', 'typhoon', 'hurricane', 'storm'] },
+  economy: { label: 'Ekonomi', color: '#534AB7', icon: 'ti-chart-line',
+    keywords: ['economy', 'inflation', 'market', 'trade', 'tariff', 'bank'] }
+};
+const OTHER = { label: 'Övrigt', color: '#5F5E5A', icon: 'ti-news' };
+
+const TIMESPAN = '1h';          // kortare fönster = mindre data per hämtning
+const MAX_TOTAL_POINTS = 60;    // tak för antal nålar som ritas ut
+const AUTO_REFRESH_MINUTES = 15; // bara om auto-uppdatering är påslagen
+
+const map = L.map('map').setView([20, 10], 2);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+  maxZoom: 18
+}).addTo(map);
+
+let markerLayer = L.layerGroup().addTo(map);
+const statusEl = document.getElementById('status');
+const errorEl = document.getElementById('error');
+
+function buildCombinedUrl() {
+  const allKeywords = Object.values(CATEGORIES).flatMap(c => c.keywords);
+  const query = `(${allKeywords.join(' OR ')})`;
+  const base = 'https://api.gdeltproject.org/api/v2/geo/geo';
+  const params = new URLSearchParams({
+    query: query,
+    format: 'geojson',
+    mode: 'PointData',
+    timespan: TIMESPAN
+  });
+  return `${base}?${params.toString()}`;
+}
+
+// Klassificerar en träff baserat på vilka nyckelord som förekommer i
+// platsnamnet/artikeltexten. Körs lokalt - ingen extra nätverkstrafik.
+function classify(text) {
+  const lower = text.toLowerCase();
+  for (const [key, cfg] of Object.entries(CATEGORIES)) {
+    if (cfg.keywords.some(kw => lower.includes(kw))) {
+      return { key, ...cfg };
+    }
+  }
+  return { key: 'other', ...OTHER };
+}
+
+// GDELT:s GeoJSON kan skilja lite i fältnamn beroende på läge, så vi
+// försöker plocka ut rubrik/länk på ett par olika sätt.
+function extractArticles(feature) {
+  const p = feature.properties || {};
+  const html = p.html || '';
+  const results = [];
+  if (html) {
+    const div = document.createElement('div');
+    div.innerHTML = html;
+    div.querySelectorAll('a').forEach(a => {
+      results.push({ title: a.textContent.trim(), url: a.href });
+    });
+  }
+  if (results.length === 0 && p.name) {
+    results.push({ title: p.name, url: null });
+  }
+  return results.slice(0, 3);
+}
+
+async function loadAll() {
+  statusEl.textContent = 'Laddar...';
+  errorEl.style.display = 'none';
+  markerLayer.clearLayers();
+
+  let data;
+  try {
+    const res = await fetch(buildCombinedUrl());
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    data = await res.json();
+  } catch (err) {
+    errorEl.style.display = 'block';
+    errorEl.textContent = 'Kunde inte hämta data från GDELT just nu. Detta kan bero på nätverksbegränsningar (CORS) i din webbläsare/miljö, eller att API:et är tillfälligt otillgängligt. Öppna filen lokalt i en vanlig webbläsare (dubbelklicka på .html-filen) om du testar den i en sandlåda.';
+    statusEl.textContent = 'Misslyckades';
+    return;
+  }
+
+  const features = (data.features || []).slice(0, MAX_TOTAL_POINTS);
+  let plotted = 0;
+
+  features.forEach(f => {
+    const coords = f.geometry && f.geometry.coordinates;
+    if (!coords || coords.length < 2) return;
+    const [lng, lat] = coords;
+    const articles = extractArticles(f);
+    const placeName = (f.properties && f.properties.name) || 'Okänd plats';
+    const classifyText = `${placeName} ${(f.properties && f.properties.html) || ''}`;
+    const cat = classify(classifyText);
+
+    const icon = L.divIcon({
+      className: '',
+      html: `<div class="news-pin" style="background:${cat.color}"><i class="ti ${cat.icon}" aria-hidden="true"></i></div>`,
+      iconSize: [26, 26], iconAnchor: [13, 13]
+    });
+
+    const marker = L.marker([lat, lng], { icon });
+    const articleHtml = articles.map(a =>
+      a.url
+        ? `<div class="popup-link"><a href="${a.url}" target="_blank" rel="noopener">${a.title}</a></div>`
+        : `<div class="popup-link">${a.title}</div>`
+    ).join('');
+
+    marker.bindPopup(`
+      <p class="popup-cat" style="color:${cat.color}">${cat.label}</p>
+      <p class="popup-title">${placeName}</p>
+      ${articleHtml || '<div class="popup-link">Ingen artikeldetalj tillgänglig</div>'}
+    `);
+    marker.addTo(markerLayer);
+    plotted++;
+  });
+
+  statusEl.textContent = `Uppdaterad ${new Date().toLocaleTimeString('sv-SE')} · ${plotted} nålar · senaste ${TIMESPAN}`;
+}
+
+let autoRefreshTimer = null;
+function setAutoRefresh(on) {
+  if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+  autoRefreshTimer = on ? setInterval(loadAll, AUTO_REFRESH_MINUTES * 60 * 1000) : null;
+}
+
+loadAll();
+</script>
+</body>
+</html>
