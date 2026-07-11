@@ -98,6 +98,13 @@ function buildCombinedUrl() {
   return `${base}?${params.toString()}`;
 }
 
+// GDELT:s API sätter inte Access-Control-Allow-Origin, så webbläsaren
+// blockerar ett direkt fetch-anrop (CORS). Vi rutar därför anropet via
+// en gratis öppen CORS-proxy som lägger till rätt headers åt oss.
+function withCorsProxy(url) {
+  return `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
+}
+
 // Klassificerar en träff baserat på vilka nyckelord som förekommer i
 // platsnamnet/artikeltexten. Körs lokalt - ingen extra nätverkstrafik.
 function classify(text) {
@@ -134,16 +141,25 @@ async function loadAll() {
   errorEl.style.display = 'none';
   markerLayer.clearLayers();
 
+  const targetUrl = buildCombinedUrl();
   let data;
   try {
-    const res = await fetch(buildCombinedUrl());
+    // Försök först via CORS-proxyn (fungerar i vanliga webbläsare)
+    const res = await fetch(withCorsProxy(targetUrl));
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     data = await res.json();
-  } catch (err) {
-    errorEl.style.display = 'block';
-    errorEl.textContent = 'Kunde inte hämta data från GDELT just nu. Detta kan bero på nätverksbegränsningar (CORS) i din webbläsare/miljö, eller att API:et är tillfälligt otillgängligt. Öppna filen lokalt i en vanlig webbläsare (dubbelklicka på .html-filen) om du testar den i en sandlåda.';
-    statusEl.textContent = 'Misslyckades';
-    return;
+  } catch (proxyErr) {
+    try {
+      // Reservförsök: direktanrop, ifall CORS skulle vara tillåtet ändå
+      const res2 = await fetch(targetUrl);
+      if (!res2.ok) throw new Error(`HTTP ${res2.status}`);
+      data = await res2.json();
+    } catch (directErr) {
+      errorEl.style.display = 'block';
+      errorEl.textContent = 'Kunde inte hämta data just nu, varken via proxy eller direkt. GDELT eller CORS-proxyn kan vara tillfälligt nere. Testa att klicka "Uppdatera" igen om en liten stund.';
+      statusEl.textContent = 'Misslyckades';
+      return;
+    }
   }
 
   const features = (data.features || []).slice(0, MAX_TOTAL_POINTS);
